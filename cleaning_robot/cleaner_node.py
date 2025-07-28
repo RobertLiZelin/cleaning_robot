@@ -5,13 +5,14 @@ import time
 
 from nav_msgs.msg import OccupancyGrid
 
+from .path_executor import PathExecutor
 from .astar import astar
 from .bfs import bfs_nearest_unclean
 from .map_manager import convert_slam_map_to_internal, generate_sample_map
 from .viz_utils import PathPublisher
 from .map_utils import MapPublisher
 from .utils import is_cell_traversable, compute_obstacle_distance_map
-from .utils import is_cell_traversable, compute_obstacle_distance_map, mark_robot_footprint_clean, mark_footprint_along_path
+from .utils import mark_robot_footprint_clean, mark_footprint_along_path
 
 
 class CleanerNode(Node):
@@ -19,14 +20,14 @@ class CleanerNode(Node):
         super().__init__('cleaner_node')
 
         # 🧩 参数配置
-        self.robot_radius_m = 0.283         # 机器人外接圆半径 (40cm正方形)
-        self.map_resolution = 0.05          # 地图每个cell代表的长度（单位m）
+        self.robot_radius_m = 0.283
+        self.map_resolution = 0.05
         self.robot_radius_cells = int(np.ceil(self.robot_radius_m / self.map_resolution))
 
         self.grid_map = None
         self.distance_map = None
         self.map_ready = False
-        self.robot_pos = [10, 10]  # 逻辑坐标系下位置
+        self.robot_pos = [10, 10]
 
         self.path = []
         self.cleaned = set()
@@ -41,6 +42,9 @@ class CleanerNode(Node):
             self.map_callback,
             10
         )
+
+        self.path_executor = PathExecutor(self)
+        self.sim_path = []
 
         self.declare_parameter("slam_timeout", 5.0)
         self.slam_timeout = self.get_parameter("slam_timeout").get_parameter_value().double_value
@@ -83,21 +87,59 @@ class CleanerNode(Node):
 
     def start_cleaning(self):
         self.map_pub.publish_map(self.grid_map)
-        self.clean_timer = self.create_timer(0.05, self.clean_step)
 
-    def is_valid(self, r, c):
-        return 0 <= r < self.grid_map.shape[0] and 0 <= c < self.grid_map.shape[1]
+        r, c = self.robot_pos
+        if not np.any(self.grid_map == 1):
+            self.get_logger().info("✅ No cleaning needed. Map already clean.")
+            return
+
+        goal = bfs_nearest_unclean(
+            self.grid_map, r, c,
+            robot_radius_cells=self.robot_radius_cells
+        )
+
+        if goal is None:
+            self.get_logger().warn("⚠️ No reachable unclean cell found.")
+            return
+
+        path = astar(
+            self.grid_map, (r, c), goal,
+            robot_radius_cells=self.robot_radius_cells,
+            distance_map=self.distance_map,
+            alpha=1.0
+        )
+
+        if not path:
+            self.get_logger().warn("⚠️ A* failed to find a path.")
+            return
+
+        path_in_meters = [
+            (col * self.map_resolution, row * self.map_resolution)
+            for row, col in path
+        ]
+
+        # 🚀 尝试 Nav2 控制器是否可用
+        if not self.path_executor.client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().error("❌ FollowPath server not available. Falling back to simulation.")
+            self.sim_path = path
+            self.start_cleaning_simulation()
+            return
+
+        self.path_executor.send_path(path_in_meters)
+
+    def start_cleaning_simulation(self):
+        self.get_logger().warn("⚠️ Running local simulation instead of real robot control.")
+        self.clean_timer = self.create_timer(0.05, self.clean_step)
 
     def clean_step(self):
         r, c = self.robot_pos
-        self.get_logger().info(f"🔍 Entering clean_step. Current position: ({r}, {c}), value: {self.grid_map[r, c]}")
+        # self.get_logger().info(f"🧹 Cleaning step at ({r}, {c})")
 
-        # 清扫当前区域（整块 footprint）
+        # 清扫当前位置
         mark_robot_footprint_clean(self.grid_map, r, c, self.robot_radius_cells)
         self.cleaned.add((r, c))
         self.total_steps += 1
 
-        # 使用重叠策略向前推进一个方向（覆盖式滑动）
         step = max(1, self.robot_radius_cells)
         moved = False
         for dr, dc in [(0, 1), (-1, 0), (0, -1), (1, 0)]:
@@ -109,10 +151,9 @@ class CleanerNode(Node):
                 moved = True
                 break
 
-        # 若无法直接推进，则切换为 A* 路径搜索
         if not moved:
             if not np.any(self.grid_map == 1):
-                self.get_logger().info(f"✅ Cleaning complete! Steps: {self.total_steps}")
+                self.get_logger().info(f"✅ Simulation cleaning complete! Steps: {self.total_steps}")
                 self.destroy_timer(self.clean_timer)
                 return
 
@@ -120,9 +161,8 @@ class CleanerNode(Node):
                 self.grid_map, r, c,
                 robot_radius_cells=self.robot_radius_cells
             )
-
             if goal is None:
-                self.get_logger().warn("⚠️ No reachable unclean cell found.")
+                self.get_logger().warn("⚠️ No reachable unclean cell in simulation.")
                 self.destroy_timer(self.clean_timer)
                 return
 
@@ -137,24 +177,20 @@ class CleanerNode(Node):
                 for prev, curr in zip(path[:-1], path[1:]):
                     self.robot_pos = list(curr)
                     r, c = self.robot_pos
-
-                    # 沿路径填补 footprint，防止路径之间断裂
                     mark_footprint_along_path(self.grid_map, prev, curr, self.robot_radius_cells)
-
                     self.cleaned.add((r, c))
                     self.total_steps += 1
-
                     self.path.append((c, r))
                     self.path_pub.publish_path(self.path)
                     self.map_pub.publish_map(self.grid_map)
                     time.sleep(0.01)
 
-        # 发布当前位置
         self.path.append((c, r))
         self.path_pub.publish_path(self.path)
         self.map_pub.publish_map(self.grid_map)
 
-
+    def is_valid(self, r, c):
+        return 0 <= r < self.grid_map.shape[0] and 0 <= c < self.grid_map.shape[1]
 
 
 def main(args=None):
